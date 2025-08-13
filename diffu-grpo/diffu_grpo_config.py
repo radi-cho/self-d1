@@ -385,3 +385,14 @@ class DiffuGRPOConfig(TrainingArguments):
         default=True,
         metadata={"help": "Whether to randomly mask tokens."},
     )
+
+    # Self-certainty reward configuration
+    use_self_certainty_reward: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True, compute rewards as self-certainty (average KL(U || p_πθ(·|q,o_{<t}))) "
+                "using the d1 masked log-probability estimation to obtain p."
+            )
+        },
+    )

@@ -6,6 +6,7 @@ from transformers import PreTrainedModel, PreTrainedTokenizerBase, TrainerCallba
 from datasets import Dataset, IterableDataset
 import warnings
 import torch.nn.functional as F
+import math
 from trl.trainer.grpo_config import GRPOConfig
 from trl.extras.profiling import profiling_decorator, profiling_context
 from transformers.utils import is_peft_available
@@ -460,11 +461,11 @@ class DiffuGRPOTrainer(GRPOTrainer):
         all_old_per_token_logps = []
         all_ref_per_token_logps = []
         with torch.no_grad():
+            # repeat prompt completion ids self.num_iterations times
+            prompt_completion_ids_expanded = prompt_completion_ids.unsqueeze(0).expand(
+                self.num_iterations, -1, -1
+            )
             if self.num_iterations > 1:
-                # repeat prompt completion ids self.num_iterations times
-                prompt_completion_ids_expanded = prompt_completion_ids.unsqueeze(0).expand(
-                    self.num_iterations, -1, -1
-                )
                 old_per_token_logps = self._get_per_token_logps(
                     self.model, prompt_completion_ids_expanded, logits_to_keep, mask_seeds
                 )
@@ -490,67 +491,135 @@ class DiffuGRPOTrainer(GRPOTrainer):
         else:
             completions = completions_text
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
-        for i, (reward_func, reward_processing_class) in enumerate(
-            zip(self.reward_funcs, self.reward_processing_classes)
-        ):
-            if isinstance(
-                reward_func, nn.Module
-            ):  # Module instead of PretrainedModel for compat with compiled models
-                reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
-            else:
-                reward_func_name = reward_func.__name__
-            with profiling_context(self, reward_func_name):
+        if getattr(self.args, "use_self_certainty_reward", False):
+            with torch.no_grad():
+                # Build prompt index for masking strategy used in d1 log-prob estimation
+                seq_len = prompt_completion_ids.size(1)
+                prompt_index = torch.zeros(seq_len, dtype=torch.bool, device=device)
+                prompt_index[: prompt_ids.size(1)] = True
 
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                output_reward_func = reward_func(
-                    prompts=prompts,
-                    completions=completions,
-                    step=self._step,
-                    run_name=self.args.output_dir,
-                    **reward_kwargs,
-                )
-                # Convert None values to NaN
-                output_reward_func = [
-                    reward if reward is not None else torch.nan for reward in output_reward_func
-                ]
+                # Compute logits for all GRPO mask iterations (d1 estimation)
+                if isinstance(mask_seeds, torch.Tensor):
+                    seeds_list = mask_seeds.tolist()
+                else:
+                    seeds_list = list(mask_seeds)
 
-                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                all_perturbed = []
+                for seed_value in seeds_list:
+                    perturbed_seq, _ = self.forward_process(
+                        prompt_completion_ids, prompt_index, self.args.mask_id, seed=int(seed_value)
+                    )
+                    all_perturbed.append(perturbed_seq)
+                perturbed_seq_big = torch.cat(all_perturbed, dim=0)  # [μ*B, L]
 
-        # If all reward functions return None for a given row, issue a detailed warning
-        if torch.isnan(rewards_per_func).all(dim=1).any():
-            nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
-            row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
-            row_reward_kwargs["prompt"] = prompts[nan_row_idx]
-            row_reward_kwargs["completion"] = completions[nan_row_idx]
-            warnings.warn(
-                f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
-                "Please ensure that at least one reward function returns a valid reward."
+                logits_big = self.get_logits(
+                    self.model, perturbed_seq_big, prompt_index, self.args.cfg_scale, self.args.mask_id
+                )  # [μ*B, L, V]
+                completion_logits_big = logits_big[:, -logits_to_keep:, :]  # [μ*B, T, V]
+                completion_mask_big = completion_mask.repeat(len(seeds_list), 1)  # [μ*B, T]
+
+                # Compute self-certainty: KL(U || p) averaged over completion positions
+                # KL(U||p) = CE(U,p) - H(U) = [ - (1/V) sum_j log p_j ] - log V
+                V = completion_logits_big.size(-1)
+                logZ = torch.logsumexp(completion_logits_big, dim=-1)  # [μ*B, T]
+                sum_logits = completion_logits_big.sum(dim=-1)  # [μ*B, T]
+                sum_log_probs = sum_logits - V * logZ  # sum_j log p_j
+                ce_uniform = -(sum_log_probs / V)  # [μ*B, T]
+                kl_uniform = ce_uniform - math.log(V)  # [μ*B, T]
+                # Length-normalized by actual generated length (up to EOS)
+                length = completion_mask_big.sum(dim=1).clamp_min(1)
+                rewards_local = (kl_uniform * completion_mask_big).sum(dim=1) / length  # [μ*B]
+                rewards_local = rewards_local.view(len(seeds_list), -1).mean(dim=0)  # [B]
+
+            rewards = gather(rewards_local)
+
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            eps = 1e-6
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + eps)
+            zero_std_count = (std_grouped_rewards < 1e-6).sum().item()
+            total_prompts = std_grouped_rewards.size(0)
+            zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
+
+            # Slice advantages for this process
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
             )
+            advantages = advantages[process_slice]
 
-        rewards_per_func = gather(rewards_per_func)
-        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+            # Log metrics
+            mode = "eval" if self.control.should_evaluate else "train"
+            self._metrics[mode]["rewards/self_certainty_kl_mean"].append(rewards.mean().item())
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        else:
+            rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+            for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+            ):
+                if isinstance(
+                    reward_func, nn.Module
+                ):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = f"reward {reward_func.config._name_or_path.split('/')[-1]}"
+                else:
+                    reward_func_name = reward_func.__name__
+                with profiling_context(self, reward_func_name):
 
-        # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+                    # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                    keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                    reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                    output_reward_func = reward_func(
+                        prompts=prompts,
+                        completions=completions,
+                        step=self._step,
+                        run_name=self.args.output_dir,
+                        **reward_kwargs,
+                    )
+                    # Convert None values to NaN
+                    output_reward_func = [
+                        reward if reward is not None else torch.nan for reward in output_reward_func
+                    ]
 
-        # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = rewards - mean_grouped_rewards
-        # Count prompts with zero std deviation
-        zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
-        total_prompts = std_grouped_rewards.size(0)
-        zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
+                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
-        process_slice = slice(
-            self.accelerator.process_index * len(prompts),
-            (self.accelerator.process_index + 1) * len(prompts),
-        )
-        advantages = advantages[process_slice]
+            # If all reward functions return None for a given row, issue a detailed warning
+            if torch.isnan(rewards_per_func).all(dim=1).any():
+                nan_row_idx = torch.isnan(rewards_per_func).all(dim=1).nonzero(as_tuple=True)[0][0]
+                row_reward_kwargs = {key: value[nan_row_idx] for key, value in reward_kwargs.items()}
+                row_reward_kwargs["prompt"] = prompts[nan_row_idx]
+                row_reward_kwargs["completion"] = completions[nan_row_idx]
+                warnings.warn(
+                    f"All reward functions returned None for the following kwargs: {row_reward_kwargs}. "
+                    "Please ensure that at least one reward function returns a valid reward."
+                )
+
+            rewards_per_func = gather(rewards_per_func)
+            rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
+
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+            # Normalize the rewards to compute the advantages
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = rewards - mean_grouped_rewards
+            # Count prompts with zero std deviation
+            zero_std_count = (std_grouped_rewards < 1e-6).sum().item()  # Using a small threshold
+            total_prompts = std_grouped_rewards.size(0)
+            zero_std_ratio = zero_std_count / total_prompts if total_prompts > 0 else 0.0
+
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            advantages = advantages[process_slice]
 
         # Log the metrics
         mode = "eval" if self.control.should_evaluate else "train"
@@ -559,19 +628,20 @@ class DiffuGRPOTrainer(GRPOTrainer):
         self._metrics[mode]["completion_length"].append(completion_length)
         self._metrics[mode]["zero_std_ratio"].append(zero_std_ratio)
 
-        # Calculate mean reward per function, but only for samples where the function was applied
-        for i, reward_func in enumerate(self.reward_funcs):
-            if isinstance(
-                reward_func, nn.Module
-            ):  # Module instead of PretrainedModel for compat with compiled models
-                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
-            else:
-                reward_func_name = reward_func.__name__
-            # Only calculate mean for samples where this reward function was applied (non-NaN values)
-            mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
-            self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
-        self._metrics[mode]["reward"].append(rewards.mean().item())
-        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+        if not getattr(self.args, "use_self_certainty_reward", False):
+            # Calculate mean reward per function, but only for samples where the function was applied
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(
+                    reward_func, nn.Module
+                ):  # Module instead of PretrainedModel for compat with compiled models
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    reward_func_name = reward_func.__name__
+                # Only calculate mean for samples where this reward function was applied (non-NaN values)
+                mean_rewards = torch.nanmean(rewards_per_func[:, i]).item()
+                self._metrics[mode][f"rewards/{reward_func_name}"].append(mean_rewards)
+            self._metrics[mode]["reward"].append(rewards.mean().item())
+            self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
